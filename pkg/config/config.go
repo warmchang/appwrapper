@@ -19,6 +19,8 @@ package config
 import (
 	"fmt"
 	"time"
+
+	"sigs.k8s.io/kueue/apis/config/v1beta1"
 )
 
 type OperatorConfig struct {
@@ -29,13 +31,18 @@ type OperatorConfig struct {
 }
 
 type AppWrapperConfig struct {
-	ManageJobsWithoutQueueName bool                  `json:"manageJobsWithoutQueueName,omitempty"`
-	EnableKueueIntegrations    bool                  `json:"enableKueueIntegrations,omitempty"`
-	DisableChildAdmissionCtrl  bool                  `json:"disableChildAdmissionCtrl,omitempty"`
-	UserRBACAdmissionCheck     bool                  `json:"userRBACAdmissionCheck,omitempty"`
-	FaultTolerance             *FaultToleranceConfig `json:"faultTolerance,omitempty"`
-	SchedulerName              string                `json:"schedulerName,omitempty"`
-	QueueName                  string                `json:"queueName,omitempty"`
+	EnableKueueIntegrations bool                  `json:"enableKueueIntegrations,omitempty"`
+	KueueJobReconciller     *KueueJobReconciller  `json:"kueueJobReconciller,omitempty"`
+	UserRBACAdmissionCheck  bool                  `json:"userRBACAdmissionCheck,omitempty"`
+	FaultTolerance          *FaultToleranceConfig `json:"faultTolerance,omitempty"`
+	SchedulerName           string                `json:"schedulerName,omitempty"`
+	DefaultQueueName        string                `json:"defaultQueueName,omitempty"`
+}
+
+type KueueJobReconciller struct {
+	ManageJobsWithoutQueueName bool                      `json:"manageJobsWithoutQueueName,omitempty"`
+	WaitForPodsReady           *v1beta1.WaitForPodsReady `json:"waitForPodsReady,omitempty"`
+	LabelKeysToCopy            []string                  `json:"labelKeysToCopy,omitempty"`
 }
 
 type FaultToleranceConfig struct {
@@ -79,10 +86,13 @@ type HealthConfiguration struct {
 // NewAppWrapperConfig constructs an AppWrapperConfig and fills in default values
 func NewAppWrapperConfig() *AppWrapperConfig {
 	return &AppWrapperConfig{
-		ManageJobsWithoutQueueName: true,
-		EnableKueueIntegrations:    true,
-		DisableChildAdmissionCtrl:  false,
-		UserRBACAdmissionCheck:     true,
+		EnableKueueIntegrations: true,
+		KueueJobReconciller: &KueueJobReconciller{
+			ManageJobsWithoutQueueName: true,
+			WaitForPodsReady:           &v1beta1.WaitForPodsReady{Enable: true},
+			LabelKeysToCopy:            []string{},
+		},
+		UserRBACAdmissionCheck: true,
 		FaultTolerance: &FaultToleranceConfig{
 			AdmissionGracePeriod:        1 * time.Minute,
 			WarmupGracePeriod:           5 * time.Minute,

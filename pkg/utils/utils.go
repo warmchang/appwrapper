@@ -22,6 +22,13 @@ import (
 	"strconv"
 	"strings"
 
+	//  Import the crypto sha256 algorithm for the docker image parser to work
+	_ "crypto/sha256"
+	//  Import the crypto/sha512 algorithm for the docker image parser to work with 384 and 512 sha hashes
+	_ "crypto/sha512"
+
+	dockerref "github.com/distribution/reference"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -40,30 +47,143 @@ func GetPodTemplateSpec(obj *unstructured.Unstructured, path string) (*v1.PodTem
 		return nil, err
 	}
 
-	// Extract the PodSpec that should be at candidatePTS.spec
-	podTemplate := &v1.PodTemplate{}
+	// Convert candidatePTS.spec to a natively-typed PodSpec
+	// NOTE: candidatePTS _may_ be a Pod, not a PodSpecTemplate so only parse the Spec.
+	src := &v1.PodSpec{}
 	spec, ok := candidatePTS["spec"].(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("content at %v does not contain a spec", path)
 	}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructuredWithValidation(spec, &podTemplate.Template.Spec, true); err != nil {
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructuredWithValidation(spec, src, true); err != nil {
 		return nil, fmt.Errorf("content at %v.spec not parseable as a v1.PodSpec: %w", path, err)
 	}
 
-	// Set default values. Required for proper operation of Kueue's ComparePodSetSlices
-	setObjectDefaults_PodTemplate(podTemplate)
+	// Now, copy just the subset of src that is relevant to Kueue.
+	// We must deeply ensure that any fields with non-zero default values
+	// are copied as-if src had been processed by the APIServer.
+	// This ensures proper operation of Kueue's ComparePodSetSlices
 
-	// Copy in the subset of the metadate expected by Kueye.
+	// Metadata
+	dst := &v1.PodTemplateSpec{}
 	if metadata, ok := candidatePTS["metadata"].(map[string]interface{}); ok {
 		if labels, ok := metadata["labels"].(map[string]string); ok {
-			podTemplate.Template.ObjectMeta.Labels = labels
+			dst.Labels = labels
 		}
 		if annotations, ok := metadata["annotations"].(map[string]string); ok {
-			podTemplate.Template.ObjectMeta.Annotations = annotations
+			dst.Annotations = annotations
 		}
 	}
 
-	return &podTemplate.Template, nil
+	// Spec
+	if len(src.InitContainers) > 0 {
+		dst.Spec.InitContainers = copyContainers(src.InitContainers)
+	}
+	dst.Spec.Containers = copyContainers(src.Containers)
+	if src.RestartPolicy == "" {
+		dst.Spec.RestartPolicy = v1.RestartPolicyAlways
+	} else {
+		dst.Spec.RestartPolicy = src.RestartPolicy
+	}
+	if src.TerminationGracePeriodSeconds == nil {
+		tmp := int64(v1.DefaultTerminationGracePeriodSeconds)
+		dst.Spec.TerminationGracePeriodSeconds = &tmp
+	}
+	if src.DNSPolicy == "" {
+		dst.Spec.DNSPolicy = v1.DNSClusterFirst
+	} else {
+		dst.Spec.DNSPolicy = src.DNSPolicy
+	}
+	dst.Spec.NodeSelector = src.NodeSelector
+	dst.Spec.NodeName = src.NodeName
+	if src.SecurityContext == nil {
+		dst.Spec.SecurityContext = &v1.PodSecurityContext{}
+	} else {
+		dst.Spec.SecurityContext = src.SecurityContext
+	}
+	dst.Spec.Affinity = src.Affinity
+	if src.SchedulerName == "" {
+		dst.Spec.SchedulerName = v1.DefaultSchedulerName
+	} else {
+		dst.Spec.SchedulerName = src.SchedulerName
+	}
+	dst.Spec.Tolerations = src.Tolerations
+	dst.Spec.PriorityClassName = src.PriorityClassName
+	// Intentionally not copying/defaulting Priority; Kueue computes Workload.Priority from PriorityClassName and ignores Priority
+	if src.PreemptionPolicy == nil {
+		tmp := v1.PreemptLowerPriority
+		dst.Spec.PreemptionPolicy = &tmp
+	} else {
+		dst.Spec.PreemptionPolicy = src.PreemptionPolicy
+	}
+	dst.Spec.Overhead = defaultResourceList(src.Overhead)
+	dst.Spec.TopologySpreadConstraints = src.TopologySpreadConstraints
+	return dst, nil
+}
+
+func copyContainers(src []v1.Container) []v1.Container {
+	dst := make([]v1.Container, len(src))
+	for i := range src {
+		dst[i].Name = src[i].Name
+		dst[i].Image = src[i].Image
+		dst[i].Command = src[i].Command
+		dst[i].Args = src[i].Args
+		dst[i].Resources.Requests = defaultResourceList(src[i].Resources.Requests)
+		dst[i].Resources.Limits = defaultResourceList(src[i].Resources.Limits)
+		if src[i].TerminationMessagePath == "" {
+			dst[i].TerminationMessagePath = v1.TerminationMessagePathDefault
+		} else {
+			dst[i].TerminationMessagePath = src[i].TerminationMessagePath
+		}
+		if src[i].TerminationMessagePolicy == "" {
+			dst[i].TerminationMessagePolicy = v1.TerminationMessageReadFile
+		} else {
+			dst[i].TerminationMessagePolicy = src[i].TerminationMessagePolicy
+		}
+		if src[i].ImagePullPolicy == "" {
+			if getImageTag(src[i].Image) == "latest" {
+				dst[i].ImagePullPolicy = v1.PullAlways
+			} else {
+				dst[i].ImagePullPolicy = v1.PullIfNotPresent
+			}
+		} else {
+			dst[i].ImagePullPolicy = src[i].ImagePullPolicy
+		}
+		dst[i].SecurityContext = src[i].SecurityContext
+	}
+
+	return dst
+}
+
+func defaultResourceList(rl v1.ResourceList) v1.ResourceList {
+	for key, val := range rl {
+		const milliScale = -3
+		val.RoundUp(milliScale)
+		rl[key] = val
+	}
+	return rl
+}
+
+// getImageTag parses a docker image string and returns the tag.
+// If both tag and digest are empty,"latest" will be returned.
+func getImageTag(image string) string {
+	named, err := dockerref.ParseNormalizedNamed(image)
+	if err != nil {
+		return ""
+	}
+	var tag, digest string
+	tagged, ok := named.(dockerref.Tagged)
+	if ok {
+		tag = tagged.Tag()
+	}
+	digested, ok := named.(dockerref.Digested)
+	if ok {
+		digest = digested.Digest().String()
+	}
+	// If no tag was specified, use the default "latest".
+	if len(tag) == 0 && len(digest) == 0 {
+		tag = "latest"
+	}
+	return tag
 }
 
 // GetReplicas parses the value at the given path within obj as an int
@@ -165,14 +285,46 @@ func Replicas(ps workloadv1beta2.AppWrapperPodSet) int32 {
 	}
 }
 
-func ExpectedPodCount(aw *workloadv1beta2.AppWrapper) int32 {
+func ExpectedPodCount(aw *workloadv1beta2.AppWrapper) (int32, error) {
+	if err := EnsureComponentStatusInitialized(aw); err != nil {
+		return 0, err
+	}
 	var expected int32
 	for _, c := range aw.Status.ComponentStatus {
 		for _, s := range c.PodSets {
 			expected += Replicas(s)
 		}
 	}
-	return expected
+	return expected, nil
+}
+
+// EnsureComponentStatusInitialized initializes aw.Status.ComponenetStatus, including performing PodSet inference for known GVKs
+func EnsureComponentStatusInitialized(aw *workloadv1beta2.AppWrapper) error {
+	if len(aw.Status.ComponentStatus) == len(aw.Spec.Components) {
+		return nil
+	}
+
+	// Construct definitive PodSets from the Spec + InferPodSets and cache in the Status (to avoid clashing with user updates to the Spec via apply)
+	compStatus := make([]workloadv1beta2.AppWrapperComponentStatus, len(aw.Spec.Components))
+	for idx := range aw.Spec.Components {
+		if len(aw.Spec.Components[idx].DeclaredPodSets) > 0 {
+			compStatus[idx].PodSets = aw.Spec.Components[idx].DeclaredPodSets
+		} else {
+			obj := &unstructured.Unstructured{}
+			if _, _, err := unstructured.UnstructuredJSONScheme.Decode(aw.Spec.Components[idx].Template.Raw, nil, obj); err != nil {
+				// Transient error; Template.Raw was validated by our AdmissionController
+				return err
+			}
+			podSets, err := InferPodSets(obj)
+			if err != nil {
+				// Transient error; InferPodSets was validated by our AdmissionController
+				return err
+			}
+			compStatus[idx].PodSets = podSets
+		}
+	}
+	aw.Status.ComponentStatus = compStatus
+	return nil
 }
 
 // inferReplicas parses the value at the given path within obj as an int or return 1 or error

@@ -72,10 +72,10 @@ func (w *AppWrapperWebhook) Default(ctx context.Context, obj runtime.Object) err
 
 	// Queue name and Suspend
 	if w.Config.EnableKueueIntegrations {
-		if w.Config.QueueName != "" && aw.Annotations[QueueNameLabel] == "" && aw.Labels[QueueNameLabel] == "" {
-			aw.Labels[QueueNameLabel] = w.Config.QueueName
+		if w.Config.DefaultQueueName != "" {
+			aw.Labels = utilmaps.MergeKeepFirst(aw.Labels, map[string]string{QueueNameLabel: w.Config.DefaultQueueName})
 		}
-		jobframework.ApplyDefaultForSuspend((*wlc.AppWrapper)(aw), w.Config.ManageJobsWithoutQueueName)
+		jobframework.ApplyDefaultForSuspend((*wlc.AppWrapper)(aw), true)
 	}
 
 	// inject labels with user name and id
@@ -100,7 +100,7 @@ func (w *AppWrapperWebhook) ValidateCreate(ctx context.Context, obj runtime.Obje
 	log.FromContext(ctx).V(2).Info("Validating create", "job", aw)
 	allErrors := w.validateAppWrapperCreate(ctx, aw)
 	if w.Config.EnableKueueIntegrations {
-		allErrors = append(allErrors, jobframework.ValidateCreateForQueueName((*wlc.AppWrapper)(aw))...)
+		allErrors = append(allErrors, jobframework.ValidateJobOnCreate((*wlc.AppWrapper)(aw))...)
 	}
 	return nil, allErrors.ToAggregate()
 }
@@ -112,8 +112,7 @@ func (w *AppWrapperWebhook) ValidateUpdate(ctx context.Context, oldObj, newObj r
 	log.FromContext(ctx).V(2).Info("Validating update", "job", newAW)
 	allErrors := w.validateAppWrapperUpdate(oldAW, newAW)
 	if w.Config.EnableKueueIntegrations {
-		allErrors = append(allErrors, jobframework.ValidateUpdateForQueueName((*wlc.AppWrapper)(oldAW), (*wlc.AppWrapper)(newAW))...)
-		allErrors = append(allErrors, jobframework.ValidateUpdateForWorkloadPriorityClassName((*wlc.AppWrapper)(oldAW), (*wlc.AppWrapper)(newAW))...)
+		allErrors = append(allErrors, jobframework.ValidateJobOnUpdate((*wlc.AppWrapper)(oldAW), (*wlc.AppWrapper)(newAW))...)
 	}
 	return nil, allErrors.ToAggregate()
 }

@@ -42,18 +42,11 @@ func SetupControllers(mgr ctrl.Manager, awConfig *config.AppWrapperConfig) error
 		if err := workload.WorkloadReconciler(
 			mgr.GetClient(),
 			mgr.GetEventRecorderFor("kueue"),
-			jobframework.WithManageJobsWithoutQueueName(awConfig.ManageJobsWithoutQueueName),
+			jobframework.WithManageJobsWithoutQueueName(awConfig.KueueJobReconciller.ManageJobsWithoutQueueName),
+			jobframework.WithWaitForPodsReady(awConfig.KueueJobReconciller.WaitForPodsReady),
+			jobframework.WithLabelKeysToCopy(awConfig.KueueJobReconciller.LabelKeysToCopy),
 		).SetupWithManager(mgr); err != nil {
 			return fmt.Errorf("workload controller: %w", err)
-		}
-
-		if !awConfig.DisableChildAdmissionCtrl {
-			if err := (&workload.ChildWorkloadReconciler{
-				Client: mgr.GetClient(),
-				Scheme: mgr.GetScheme(),
-			}).SetupWithManager(mgr); err != nil {
-				return fmt.Errorf("child admission controller: %w", err)
-			}
 		}
 	}
 

@@ -22,10 +22,12 @@ import (
 	"strconv"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -37,7 +39,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	workloadv1beta2 "github.com/project-codeflare/appwrapper/api/v1beta2"
-	"github.com/project-codeflare/appwrapper/internal/controller/awstatus"
 	"github.com/project-codeflare/appwrapper/pkg/config"
 	"github.com/project-codeflare/appwrapper/pkg/utils"
 )
@@ -66,6 +67,7 @@ type podStatusSummary struct {
 type componentStatusSummary struct {
 	expected int32
 	deployed int32
+	failed   int32
 }
 
 // permission to fully control appwrappers
@@ -81,7 +83,7 @@ type componentStatusSummary struct {
 //+kubebuilder:rbac:groups=scheduling.sigs.k8s.io,resources=podgroups,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=scheduling.x-k8s.io,resources=podgroups,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=kubeflow.org,resources=pytorchjobs,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=cluster.ray.io,resources=rayclusters,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=ray.io,resources=rayclusters;rayjobs,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile reconciles an appwrapper
 // Please see [aw-states] for documentation of this method.
@@ -152,7 +154,7 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			}
 		}
 
-		if err := awstatus.EnsureComponentStatusInitialized(ctx, aw); err != nil {
+		if err := utils.EnsureComponentStatusInitialized(aw); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -196,6 +198,14 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 		err, fatal := r.createComponents(ctx, aw)
 		if err != nil {
+			if !fatal {
+				startTime := meta.FindStatusCondition(aw.Status.Conditions, string(workloadv1beta2.ResourcesDeployed)).LastTransitionTime
+				graceDuration := r.admissionGraceDuration(ctx, aw)
+				if time.Now().Before(startTime.Add(graceDuration)) {
+					// be patient; non-fatal error; requeue and keep trying
+					return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+				}
+			}
 			meta.SetStatusCondition(&aw.Status.Conditions, metav1.Condition{
 				Type:    string(workloadv1beta2.Unhealthy),
 				Status:  metav1.ConditionTrue,
@@ -203,7 +213,7 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				Message: fmt.Sprintf("error creating components: %v", err),
 			})
 			if fatal {
-				return r.updateStatus(ctx, aw, workloadv1beta2.AppWrapperFailed) // abort on fatal error
+				return r.updateStatus(ctx, aw, workloadv1beta2.AppWrapperFailed) // always move to failed on fatal error
 			} else {
 				return r.resetOrFail(ctx, aw)
 			}
@@ -230,6 +240,18 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				Message: fmt.Sprintf("Only found %v deployed components, but was expecting %v", compStatus.deployed, compStatus.expected),
 			})
 			return r.updateStatus(ctx, aw, workloadv1beta2.AppWrapperFailed)
+		}
+
+		// If a component's controller has put it into a failed state, we do not need
+		// to allow any further grace period.  The situation will not self-correct.
+		if compStatus.failed > 0 {
+			meta.SetStatusCondition(&aw.Status.Conditions, metav1.Condition{
+				Type:    string(workloadv1beta2.Unhealthy),
+				Status:  metav1.ConditionTrue,
+				Reason:  "FailedComponent",
+				Message: fmt.Sprintf("Found %v failed components", compStatus.failed),
+			})
+			return r.resetOrFail(ctx, aw)
 		}
 
 		// Second, check the Pod-level status of the workload
@@ -468,14 +490,20 @@ func (r *AppWrapperReconciler) getPodStatus(ctx context.Context, aw *workloadv1b
 		client.MatchingLabels{AppWrapperLabel: aw.Name}); err != nil {
 		return nil, err
 	}
-	summary := &podStatusSummary{expected: utils.ExpectedPodCount(aw)}
+	pc, err := utils.ExpectedPodCount(aw)
+	if err != nil {
+		return nil, err
+	}
+	summary := &podStatusSummary{expected: pc}
 
 	for _, pod := range pods.Items {
 		switch pod.Status.Phase {
 		case v1.PodPending:
 			summary.pending += 1
 		case v1.PodRunning:
-			summary.running += 1
+			if pod.DeletionTimestamp.IsZero() {
+				summary.running += 1
+			}
 		case v1.PodSucceeded:
 			summary.succeeded += 1
 		case v1.PodFailed:
@@ -486,22 +514,133 @@ func (r *AppWrapperReconciler) getPodStatus(ctx context.Context, aw *workloadv1b
 	return summary, nil
 }
 
+//gocyclo:ignore
 func (r *AppWrapperReconciler) getComponentStatus(ctx context.Context, aw *workloadv1beta2.AppWrapper) (*componentStatusSummary, error) {
 	summary := &componentStatusSummary{expected: int32(len(aw.Status.ComponentStatus))}
 
 	for componentIdx := range aw.Status.ComponentStatus {
 		cs := &aw.Status.ComponentStatus[componentIdx]
-		obj := &metav1.PartialObjectMetadata{TypeMeta: metav1.TypeMeta{Kind: cs.Kind, APIVersion: cs.APIVersion}}
-		if err := r.Get(ctx, types.NamespacedName{Name: cs.Name, Namespace: aw.Namespace}, obj); err == nil {
-			summary.deployed += 1
-		} else {
-			if apierrors.IsNotFound(err) {
-				meta.SetStatusCondition(&aw.Status.ComponentStatus[componentIdx].Conditions, metav1.Condition{
-					Type:   string(workloadv1beta2.Unhealthy),
-					Status: metav1.ConditionTrue,
-					Reason: "ComponentNotFound",
-				})
-			} else {
+		switch cs.APIVersion + ":" + cs.Kind {
+
+		case "batch/v1:Job":
+			obj := &batchv1.Job{}
+			if err := r.Get(ctx, types.NamespacedName{Name: cs.Name, Namespace: aw.Namespace}, obj); err == nil {
+				if obj.GetDeletionTimestamp().IsZero() {
+					summary.deployed += 1
+
+					// batch/v1 Jobs are failed when status.Conditions contains an entry with type "Failed" and status "True"
+					for _, jc := range obj.Status.Conditions {
+						if jc.Type == batchv1.JobFailed && jc.Status == v1.ConditionTrue {
+							summary.failed += 1
+						}
+					}
+				}
+
+			} else if !apierrors.IsNotFound(err) {
+				return nil, err
+			}
+
+		case "kubeflow.org/v1:PyTorchJob":
+			obj := &unstructured.Unstructured{}
+			obj.SetAPIVersion(cs.APIVersion)
+			obj.SetKind(cs.Kind)
+			if err := r.Get(ctx, types.NamespacedName{Name: cs.Name, Namespace: aw.Namespace}, obj); err == nil {
+				if obj.GetDeletionTimestamp().IsZero() {
+					summary.deployed += 1
+
+					// PyTorchJob is failed if status.Conditions contains an entry with type "Failed" and status "True"
+					status, ok := obj.UnstructuredContent()["status"]
+					if !ok {
+						continue
+					}
+					cond, ok := status.(map[string]interface{})["conditions"]
+					if !ok {
+						continue
+					}
+					condArray, ok := cond.([]interface{})
+					if !ok {
+						continue
+					}
+					for _, aCond := range condArray {
+						if condMap, ok := aCond.(map[string]interface{}); ok {
+							if condType, ok := condMap["type"]; ok && condType.(string) == "Failed" {
+								if status, ok := condMap["status"]; ok && status.(string) == "True" {
+									summary.failed += 1
+								}
+							}
+						}
+					}
+				}
+			} else if !apierrors.IsNotFound(err) {
+				return nil, err
+			}
+
+		case "ray.io/v1:RayCluster":
+			obj := &unstructured.Unstructured{}
+			obj.SetAPIVersion(cs.APIVersion)
+			obj.SetKind(cs.Kind)
+			if err := r.Get(ctx, types.NamespacedName{Name: cs.Name, Namespace: aw.Namespace}, obj); err == nil {
+				if obj.GetDeletionTimestamp().IsZero() {
+					summary.deployed += 1
+
+					/* Disabled because failed is not a terminal state.
+					 *  We've observed RC transiently entering "failed" before becoming "ready" due to ingress not being ready
+					 * TODO: Explore fixing in upstream projects.
+
+					// RayCluster is failed if status.State is "failed"
+					status, ok := obj.UnstructuredContent()["status"]
+					if !ok {
+						continue
+					}
+					state, ok := status.(map[string]interface{})["state"]
+					if !ok {
+						continue
+					}
+					if state.(string) == "failed" {
+						summary.failed += 1
+					}
+					*/
+				}
+			} else if !apierrors.IsNotFound(err) {
+				return nil, err
+			}
+
+		case "ray.io/v1:RayJob":
+			obj := &unstructured.Unstructured{}
+			obj.SetAPIVersion(cs.APIVersion)
+			obj.SetKind(cs.Kind)
+			if err := r.Get(ctx, types.NamespacedName{Name: cs.Name, Namespace: aw.Namespace}, obj); err == nil {
+				if obj.GetDeletionTimestamp().IsZero() {
+					summary.deployed += 1
+
+					/* Disabled because we are not sure if failed is  a terminal state.
+					 * TODO: Determine whether or not RayJob has the same issue as RayCluster
+
+					// RayJob is failed if status.jobsStatus is "FAILED"
+					status, ok := obj.UnstructuredContent()["status"]
+					if !ok {
+						continue
+					}
+					jobStatus, ok := status.(map[string]interface{})["jobStatus"]
+					if !ok {
+						continue
+					}
+					if jobStatus.(string) == "FAILED" {
+						summary.failed += 1
+					}
+					*/
+				}
+			} else if !apierrors.IsNotFound(err) {
+				return nil, err
+			}
+
+		default:
+			obj := &metav1.PartialObjectMetadata{TypeMeta: metav1.TypeMeta{Kind: cs.Kind, APIVersion: cs.APIVersion}}
+			if err := r.Get(ctx, types.NamespacedName{Name: cs.Name, Namespace: aw.Namespace}, obj); err == nil {
+				if obj.GetDeletionTimestamp().IsZero() {
+					summary.deployed += 1
+				}
+			} else if !apierrors.IsNotFound(err) {
 				return nil, err
 			}
 		}
